@@ -1,0 +1,11 @@
+{
+  "configurations": [
+    {
+      "name": "vcs",
+      "compileCommands": "${workspaceFolder}/bin/compile_commands.json",
+      "cStandard": "c17",
+      "cppStandard": "c++20"
+    }
+  ],
+  "version": 4
+}

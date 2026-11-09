@@ -1,0 +1,4 @@
+# Build output and tool folders
+.git/
+bin/
+.cache/
