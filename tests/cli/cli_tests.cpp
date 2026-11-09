@@ -419,3 +419,100 @@ TEST(cli, status_and_diff_fail_outside_a_repo) {
   CHECK(run_vcs(dir.path(), "status").exit_code != 0);
   CHECK(run_vcs(dir.path(), "diff").exit_code != 0);
 }
+
+// -------- branch and checkout --------
+
+namespace {
+
+void commit_file(const test::TempDir &dir, const std::string &name,
+                 const std::string &text, const std::string &message) {
+  write_file(dir / name, text);
+  run_vcs(dir.path(), "add '" + name + "'");
+  run_vcs(dir.path(), "commit -m '" + message + "'");
+}
+
+} // namespace
+
+TEST(cli, branch_lists_and_creates) {
+  test::TempDir dir;
+  setup_repo(dir);
+  commit_file(dir, "a.txt", "a\n", "first");
+
+  CHECK_EQ(run_vcs(dir.path(), "branch").out, std::string("* main\n"));
+  CHECK_EQ(run_vcs(dir.path(), "branch feature").exit_code, 0);
+  CHECK_EQ(run_vcs(dir.path(), "branch").out, std::string("  feature\n* main\n"));
+  CHECK(run_vcs(dir.path(), "branch feature").exit_code != 0);
+  CHECK(run_vcs(dir.path(), "branch 'bad name'").exit_code != 0);
+  CHECK(run_vcs(dir.path(), "branch a b").exit_code != 0);
+}
+
+TEST(cli, branch_before_first_commit_fails) {
+  test::TempDir dir;
+  setup_repo(dir);
+  CHECK(run_vcs(dir.path(), "branch feature").exit_code != 0);
+  CHECK_EQ(run_vcs(dir.path(), "branch").out, std::string());
+}
+
+TEST(cli, checkout_switches_branches) {
+  test::TempDir dir;
+  setup_repo(dir);
+  commit_file(dir, "a.txt", "main\n", "first");
+
+  RunResult created = run_vcs(dir.path(), "checkout -b feature");
+  CHECK_EQ(created.exit_code, 0);
+  CHECK_EQ(created.out, std::string("Switched to a new branch 'feature'\n"));
+  commit_file(dir, "a.txt", "feature\n", "second");
+
+  CHECK_EQ(run_vcs(dir.path(), "checkout main").out,
+           std::string("Switched to branch 'main'\n"));
+  CHECK_EQ(test::read_text(dir / "a.txt"), std::string("main\n"));
+  CHECK_EQ(run_vcs(dir.path(), "checkout main").out,
+           std::string("Already on 'main'\n"));
+
+  run_vcs(dir.path(), "checkout feature");
+  CHECK_EQ(test::read_text(dir / "a.txt"), std::string("feature\n"));
+  CHECK(contains(run_vcs(dir.path(), "status").out, "On branch feature\n"));
+}
+
+TEST(cli, checkout_commit_detaches) {
+  test::TempDir dir;
+  setup_repo(dir);
+  commit_file(dir, "a.txt", "one\n", "first");
+  std::string first = head_hash(dir.path());
+  commit_file(dir, "a.txt", "two\n", "second");
+
+  RunResult r = run_vcs(dir.path(), "checkout " + first.substr(0, 8));
+  CHECK_EQ(r.exit_code, 0);
+  CHECK_EQ(r.out, "HEAD is now at " + first.substr(0, 7) + "\n");
+  CHECK_EQ(test::read_text(dir / "a.txt"), std::string("one\n"));
+
+  CHECK(contains(run_vcs(dir.path(), "status").out,
+                 "HEAD detached at " + first.substr(0, 7) + "\n"));
+  CHECK_EQ(run_vcs(dir.path(), "branch").out,
+           "* (HEAD detached at " + first.substr(0, 7) + ")\n  main\n");
+}
+
+TEST(cli, checkout_refusal_keeps_work_and_fails) {
+  test::TempDir dir;
+  setup_repo(dir);
+  commit_file(dir, "a.txt", "main\n", "first");
+  run_vcs(dir.path(), "checkout -b feature");
+  commit_file(dir, "a.txt", "feature\n", "second");
+  run_vcs(dir.path(), "checkout main");
+
+  write_file(dir / "a.txt", "precious\n");
+  CHECK(run_vcs(dir.path(), "checkout feature").exit_code != 0);
+  CHECK_EQ(test::read_text(dir / "a.txt"), std::string("precious\n"));
+  CHECK(contains(run_vcs(dir.path(), "status").out, "On branch main\n"));
+}
+
+TEST(cli, checkout_usage_errors) {
+  test::TempDir dir;
+  setup_repo(dir);
+  commit_file(dir, "a.txt", "a\n", "first");
+  CHECK(run_vcs(dir.path(), "checkout").exit_code != 0);
+  CHECK(run_vcs(dir.path(), "checkout -x name").exit_code != 0);
+  CHECK(run_vcs(dir.path(), "checkout -b").exit_code != 0);
+  CHECK(run_vcs(dir.path(), "checkout nope").exit_code != 0);
+  CHECK(run_vcs(dir.path(), "checkout a b").exit_code != 0);
+}

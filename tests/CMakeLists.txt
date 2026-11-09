@@ -17,6 +17,7 @@ add_executable(vcs_tests
   repo/index_tests.cpp
   repo/refs_tests.cpp
   repo/repository_tests.cpp
+  repo/checkout_tests.cpp
   cli/cli_tests.cpp
 )
 target_link_libraries(vcs_tests PRIVATE vcs_core)
@@ -48,6 +49,7 @@ set(TEST_SUITES
   index
   refs
   repository
+  checkout
   cli
 )
 

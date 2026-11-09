@@ -1,6 +1,7 @@
 #pragma once
 
 #include <filesystem>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -21,6 +22,7 @@ struct LogEntry {
 
 struct StatusReport {
   std::optional<std::string> branch; // empty when HEAD is detached
+  std::optional<std::string> head;   // empty before the first commit
   bool has_commits;
   std::vector<TreeChange> staged;    // HEAD -> index
   std::vector<TreeChange> unstaged;  // index -> working files
@@ -34,6 +36,12 @@ struct FileChange {
   std::string path;
   std::optional<ByteStream> old_content;
   std::optional<ByteStream> new_content;
+};
+
+struct CheckoutResult {
+  std::optional<std::string> branch; // empty when HEAD was detached
+  std::string commit;
+  bool already_there; // the branch was already checked out; nothing changed
 };
 
 class Repository {
@@ -53,6 +61,8 @@ private:
   std::optional<std::string> head_tree() const;
   std::vector<TreeChange> staged_changes(const Index &index) const;
   std::vector<TreeChange> unstaged_changes(const Index &index) const;
+  TreeReader tree_reader(const std::map<std::string, ByteStream> *pending) const;
+  std::string resolve_commit(const std::string &spec) const;
 
 public:
   // `root` is the directory that holds .vcs
@@ -83,6 +93,22 @@ public:
   // With `staged`, HEAD against the index; without, the index against the
   // working files. Sorted by path.
   std::vector<FileChange> diff(bool staged) const;
+
+  std::optional<std::string> head_commit() const;
+  std::optional<std::string> current_branch() const;
+  std::vector<std::string> branches() const;
+
+  // A new branch at the current commit. Throws before the first commit.
+  void create_branch(const std::string &name);
+
+  // Switches to a branch, or to a commit given by its hash or a unique prefix
+  // of at least 4 characters, which detaches HEAD. Updates the working files
+  // and the index to match it.
+  //
+  // Nothing is changed if it would lose work: a file with uncommitted changes
+  // that differs between the two commits, or an untracked file in the way.
+  // Uncommitted changes to anything else are kept as they are.
+  CheckoutResult checkout(const std::string &target);
 
   std::optional<std::string> get_config(const std::string &key) const;
   void set_config(const std::string &key, const std::string &value);

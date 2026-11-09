@@ -228,7 +228,8 @@ void cmd_status(const std::vector<std::string> &args) {
   if (report.branch)
     std::cout << "On branch " << *report.branch << "\n";
   else
-    std::cout << "HEAD detached\n";
+    std::cout << "HEAD detached at " << report.head.value_or("").substr(0, 7)
+              << "\n";
 
   if (!report.has_commits)
     std::cout << "\nNo commits yet\n";
@@ -261,6 +262,57 @@ void cmd_diff(const std::vector<std::string> &args) {
     std::cout << vcs::file_diff(file.path, file.old_content, file.new_content);
 }
 
+void cmd_branch(const std::vector<std::string> &args) {
+  vcs::Repository repo = current_repo();
+
+  if (args.size() == 1) {
+    repo.create_branch(args[0]);
+    return;
+  }
+
+  if (!args.empty())
+    throw std::runtime_error("usage: vcs branch [<name>]");
+
+  std::optional<std::string> current = repo.current_branch();
+
+  if (!current)
+    std::cout << "* (HEAD detached at "
+              << repo.head_commit().value_or("").substr(0, 7) << ")\n";
+
+  for (const std::string &name : repo.branches())
+    std::cout << (name == current ? "* " : "  ") << name << "\n";
+}
+
+void cmd_checkout(const std::vector<std::string> &args) {
+  vcs::Repository repo = current_repo();
+  std::string target;
+  bool new_branch = false;
+
+  if (args.size() == 1 && !args[0].starts_with("-")) {
+    target = args[0];
+  } else if (args.size() == 2 && args[0] == "-b") {
+    target = args[1];
+    new_branch = true;
+  } else {
+    throw std::runtime_error("usage: vcs checkout [-b] <branch|commit>");
+  }
+
+  // the new branch starts at the current commit, so no files change
+  if (new_branch)
+    repo.create_branch(target);
+
+  vcs::CheckoutResult result = repo.checkout(target);
+
+  if (result.already_there)
+    std::cout << "Already on '" << *result.branch << "'\n";
+  else if (new_branch)
+    std::cout << "Switched to a new branch '" << *result.branch << "'\n";
+  else if (result.branch)
+    std::cout << "Switched to branch '" << *result.branch << "'\n";
+  else
+    std::cout << "HEAD is now at " << result.commit.substr(0, 7) << "\n";
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -291,6 +343,10 @@ int main(int argc, char **argv) {
       cmd_status(args);
     } else if (command == "diff") {
       cmd_diff(args);
+    } else if (command == "branch") {
+      cmd_branch(args);
+    } else if (command == "checkout") {
+      cmd_checkout(args);
     } else {
       std::cerr << "unknown command: " << command << "\n";
       return 1;

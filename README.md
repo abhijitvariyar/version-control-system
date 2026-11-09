@@ -24,7 +24,7 @@ step before moving to the next.
 | M3 | Compression (LZ77 + Huffman), wired into object storage | ✅ Done |
 | M4 | Staging index, `add`/`commit`/`log` | ✅ Done |
 | M5 | `status`, Myers diff, `diff` | ✅ Done |
-| M6 | Branches/refs, `checkout` | ⬜ Not started |
+| M6 | Branches/refs, `checkout` | ✅ Done |
 | M7 | Three-way merge | ⬜ Not started |
 
 ### What works right now
@@ -56,6 +56,15 @@ step before moving to the next.
   in only one of the two files are set aside before the search, so a rewritten file is quick.
   Binary files (a NUL in the first 8000 bytes) are reported, not diffed.
 - **Tree diff**: compares two trees and skips any directory with the same hash on both sides.
+- **Branches**: `branch` lists and creates them, and `checkout` switches between them or detaches
+  HEAD at a commit, given by its full hash or a unique prefix of at least 4 characters. Branch
+  names follow git's main rules, so a name like `../x` or `a..b` is refused.
+- **Safe checkout**: only files that differ between the two commits are written or deleted, and
+  folders left empty are removed. Nothing changes at all if that would lose work: a file with
+  staged or unstaged changes that the checkout would overwrite or delete, or an untracked file in
+  the way. Local changes to any other file are carried over. Every path in the target commit is
+  checked before anything is written, so a damaged or hostile tree can't write outside the
+  repository or into `.vcs`, even through a symlinked folder.
 - **Ignore rules**: a `.vcsignore` file at the repository root keeps files out of `vcs add <dir>`.
   Files that are already tracked stay tracked, and naming an ignored file directly still adds it.
 - **Corruption detection**: `ObjectStore::read` checks every object against its hash, so a damaged
@@ -92,6 +101,12 @@ step before moving to the next.
 - `diff` doesn't detect renames (a rename is a deletion plus an addition), and its `@@` lines
   leave out the nearby line git adds after them. Both are minimal, but where several equally
   short diffs exist, git's clean-up heuristics can pick a different one.
+- Branches can't be deleted or renamed yet, and `checkout` can't restore a single file.
+- `checkout` refuses to overwrite ignored files too, where git would replace them.
+- A crash part way through a `checkout` can leave some files switched and others not. All the
+  checks run first, so this needs the disk or process to fail mid-way.
+- On a case-insensitive file system, such as the default on macOS, two tracked paths that differ
+  only in case overwrite each other on checkout.
 - `TreeNode::insert` validates against absolute paths but doesn't yet reject `.`/`..`
   components. The index does reject them, so paths from `add` are safe.
 
@@ -189,6 +204,23 @@ diff --git a/README.md b/README.md
 +world
 ```
 
+Branches and checkout:
+
+```sh
+$ vcs checkout -b feature        # create a branch at the current commit and switch to it
+Switched to a new branch 'feature'
+
+$ vcs branch
+* feature
+  main
+
+$ vcs checkout main
+Switched to branch 'main'
+
+$ vcs checkout 1a2b3c4d           # any commit, by hash or unique prefix
+HEAD is now at 1a2b3c4
+```
+
 `cat-file` also decodes trees (printed `ls-tree`-style) and commits (printed as their
 raw text).
 
@@ -196,7 +228,7 @@ raw text).
 
 ```
 .vcs/
-  HEAD                       # "ref: refs/heads/main\n"
+  HEAD                       # "ref: refs/heads/<branch>\n", or a commit hash when detached
   config                     # key=value lines, such as user.name=Ada
   index                      # staging area: "<mode> <blob-hash> <path>" per line, sorted by path
   objects/<2-hex>/<62-hex>    # compressed loose objects, sharded by the first byte of the SHA-256 hash

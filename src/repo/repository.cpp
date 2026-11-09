@@ -278,6 +278,23 @@ std::optional<std::string> vcs::Repository::head_tree() const {
   return read_commit(*head).tree_hash;
 }
 
+// Reads trees from the store, or from `pending` first: trees that exist only
+// in memory, such as the index's
+vcs::TreeReader vcs::Repository::tree_reader(
+    const std::map<std::string, ByteStream> *pending) const {
+  return [this, pending](const std::string &hash) {
+    bool in_memory = pending && pending->contains(hash);
+    ByteStream buffer = in_memory ? pending->at(hash) : store.read(hash);
+
+    UnwrappedObject object = unwrap(buffer);
+
+    if (object.get_object_type() != ObjectType::Tree)
+      throw std::runtime_error("Not a tree: " + hash);
+
+    return parse_tree_entries(object.get_content());
+  };
+}
+
 std::vector<vcs::TreeChange>
 vcs::Repository::staged_changes(const Index &index) const {
   // The index's trees exist only in memory: status shouldn't write objects
@@ -287,20 +304,8 @@ vcs::Repository::staged_changes(const Index &index) const {
   for (const ByteStream &object : tree.get_objects())
     pending[SHA256().scramble(object)] = object;
 
-  TreeReader read_tree = [this, &pending](const std::string &hash) {
-    auto found = pending.find(hash);
-    ByteStream buffer =
-        found != pending.end() ? found->second : store.read(hash);
-    UnwrappedObject object = unwrap(buffer);
-
-    if (object.get_object_type() != ObjectType::Tree)
-      throw std::runtime_error("Not a tree: " + hash);
-
-    return parse_tree_entries(object.get_content());
-  };
-
-  std::vector<TreeChange> changes =
-      diff_trees(read_tree, head_tree(), to_hex(tree.get_root()->hash));
+  std::vector<TreeChange> changes = diff_trees(
+      tree_reader(&pending), head_tree(), to_hex(tree.get_root()->hash));
   sort_by_path(changes);
   return changes;
 }
@@ -331,7 +336,8 @@ vcs::StatusReport vcs::Repository::status() const {
 
   StatusReport report;
   report.branch = refs.current_branch();
-  report.has_commits = refs.head_commit().has_value();
+  report.head = refs.head_commit();
+  report.has_commits = report.head.has_value();
   report.staged = staged_changes(index);
   report.unstaged = unstaged_changes(index);
 
@@ -439,4 +445,230 @@ void vcs::Repository::set_config(const std::string &key,
     content += name + "=" + setting + "\n";
 
   write_file_atomic(vcs_dir / "config", content);
+}
+
+// -------- branches and checkout --------
+
+std::optional<std::string> vcs::Repository::head_commit() const {
+  return refs.head_commit();
+}
+
+std::optional<std::string> vcs::Repository::current_branch() const {
+  return refs.current_branch();
+}
+
+std::vector<std::string> vcs::Repository::branches() const {
+  return refs.branches();
+}
+
+void vcs::Repository::create_branch(const std::string &name) {
+  std::optional<std::string> head = refs.head_commit();
+  if (!head)
+    throw std::runtime_error("No commits yet, so there is nothing to branch from");
+
+  refs.create_branch(name, *head);
+}
+
+// A full hash, or a prefix of at least 4 that matches exactly one commit
+std::string vcs::Repository::resolve_commit(const std::string &spec) const {
+  bool is_hex = spec.size() >= 4 && spec.size() <= 64;
+  for (char chr : spec)
+    if (!((chr >= '0' && chr <= '9') || (chr >= 'a' && chr <= 'f')))
+      is_hex = false;
+
+  if (!is_hex)
+    throw std::runtime_error("Not a branch or commit: " + spec);
+
+  std::vector<std::string> candidates;
+  fs::path shard = vcs_dir / "objects" / spec.substr(0, 2);
+
+  if (fs::is_directory(shard))
+    for (const auto &entry : fs::directory_iterator(shard)) {
+      std::string hash = spec.substr(0, 2) + entry.path().filename().string();
+      if (hash.size() == 64 && hash.starts_with(spec))
+        candidates.push_back(hash);
+    }
+
+  // only commits count: a blob or tree with the same prefix isn't ambiguous
+  std::vector<std::string> commits;
+  for (const std::string &hash : candidates) {
+    ByteStream buffer = store.read(hash);
+    if (unwrap(buffer).get_object_type() == ObjectType::Commit)
+      commits.push_back(hash);
+  }
+
+  if (commits.empty())
+    throw std::runtime_error("Not a branch or commit: " + spec);
+
+  if (commits.size() > 1)
+    throw std::runtime_error("Commit prefix is ambiguous: " + spec);
+
+  return commits.front();
+}
+
+namespace {
+
+// Removes the parents of `path` that are left empty, stopping at the root
+void remove_empty_parents(const fs::path &root, const std::string &path) {
+  fs::path dir = fs::path(path).parent_path();
+
+  while (!dir.empty()) {
+    fs::path on_disk = root / dir;
+    if (!fs::is_directory(fs::symlink_status(on_disk)) || !fs::is_empty(on_disk))
+      return;
+
+    fs::remove(on_disk);
+    dir = dir.parent_path();
+  }
+}
+
+std::string list_lines(const std::vector<std::string> &paths) {
+  std::string out;
+  for (const std::string &path : paths)
+    out += "\n\t" + path;
+  return out;
+}
+
+} // namespace
+
+vcs::CheckoutResult vcs::Repository::checkout(const std::string &target) {
+  std::optional<std::string> branch;
+  std::string commit_hash;
+
+  if (std::optional<std::string> tip = refs.branch_commit(target)) {
+    branch = target;
+    commit_hash = *tip;
+  } else {
+    commit_hash = resolve_commit(target);
+  }
+
+  if (branch && branch == refs.current_branch())
+    return {branch, commit_hash, true};
+
+  std::string target_tree = read_commit(commit_hash).tree_hash;
+  Index index = Index::load(vcs_dir / "index");
+
+  std::vector<TreeChange> changes =
+      diff_trees(tree_reader(nullptr), head_tree(), target_tree);
+
+  // The new index comes first. Index::add refuses paths like "../x" or
+  // ".vcs/HEAD", so a tree that could write outside the repository fails here,
+  // before anything on disk is touched.
+  Index updated = index;
+  std::set<std::string> deleting;
+
+  for (const TreeChange &change : changes) {
+    if (change.type == ChangeType::Deleted) {
+      updated.remove(change.path);
+      deleting.insert(change.path);
+    } else {
+      updated.add(change.path, change.new_hash);
+    }
+  }
+
+  // Uncommitted work on a path the checkout changes would be lost
+  std::set<std::string> dirty;
+  for (const TreeChange &change : staged_changes(index))
+    dirty.insert(change.path);
+  for (const TreeChange &change : unstaged_changes(index))
+    dirty.insert(change.path);
+
+  std::vector<std::string> local_changes;
+  for (const TreeChange &change : changes)
+    if (dirty.contains(change.path))
+      local_changes.push_back(change.path);
+
+  if (!local_changes.empty())
+    throw std::runtime_error(
+        "Your local changes to these files would be overwritten by checkout:" +
+        list_lines(local_changes) + "\nCommit them or undo them first.");
+
+  // So would anything untracked where a file has to be written
+  std::set<std::string> in_the_way;
+
+  for (const TreeChange &change : changes) {
+    if (change.type == ChangeType::Deleted)
+      continue;
+
+    // a parent directory that is currently a file
+    for (size_t slash = change.path.find('/'); slash != std::string::npos;
+         slash = change.path.find('/', slash + 1)) {
+      std::string parent = change.path.substr(0, slash);
+      fs::file_status status = fs::symlink_status(root / parent);
+
+      if (fs::exists(status) && !fs::is_directory(status) &&
+          !deleting.contains(parent))
+        in_the_way.insert(parent);
+    }
+
+    fs::path on_disk = root / change.path;
+    fs::file_status status = fs::symlink_status(on_disk);
+
+    if (!fs::exists(status))
+      continue;
+
+    if (!fs::is_directory(status)) {
+      if (!index.get_entries().contains(change.path))
+        in_the_way.insert(change.path);
+      continue;
+    }
+
+    // a directory where the file goes: fine only if checkout empties it
+    for (const auto &entry : fs::recursive_directory_iterator(on_disk)) {
+      if (entry.is_directory() && !entry.is_symlink())
+        continue;
+
+      std::string inside = (fs::path(change.path) /
+                            entry.path().lexically_relative(on_disk))
+                               .generic_string();
+      if (!deleting.contains(inside))
+        in_the_way.insert(inside);
+    }
+  }
+
+  if (!in_the_way.empty())
+    throw std::runtime_error(
+        "These untracked files would be overwritten by checkout:" +
+        list_lines({in_the_way.begin(), in_the_way.end()}) +
+        "\nMove or remove them first.");
+
+  for (const TreeChange &change : changes)
+    if (change.type != ChangeType::Deleted && !store.exists(change.new_hash))
+      throw std::runtime_error("Missing object " + change.new_hash + " for " +
+                               change.path);
+
+  // Every check has passed. Deletions go first, so files can replace
+  // directories and the other way round.
+  for (const TreeChange &change : changes) {
+    if (change.type != ChangeType::Deleted)
+      continue;
+
+    fs::remove(root / change.path);
+    remove_empty_parents(root, change.path);
+  }
+
+  for (const TreeChange &change : changes) {
+    if (change.type == ChangeType::Deleted)
+      continue;
+
+    fs::path on_disk = root / change.path;
+
+    // only empty directories can be left here, after the checks above
+    if (fs::is_directory(fs::symlink_status(on_disk)))
+      fs::remove_all(on_disk);
+
+    fs::create_directories(on_disk.parent_path());
+
+    ByteStream content = read_blob(change.new_hash);
+    write_file_atomic(on_disk, std::string(content.begin(), content.end()));
+  }
+
+  updated.save(vcs_dir / "index");
+
+  if (branch)
+    refs.point_head_at_branch(*branch);
+  else
+    refs.detach_head(commit_hash);
+
+  return {branch, commit_hash, false};
 }
